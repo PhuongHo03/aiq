@@ -35,7 +35,7 @@ jobs:
 
       - name: Pytest smoke + coverage xml
         run: |
-          uv run pytest tests/aiq_agent/common -q --cov=src/aiq_agent --cov-report=xml
+          uv run pytest frontends/aiq_api/tests/test_auth.py frontends/aiq_api/tests/test_auth_errors.py frontends/aiq_api/tests/test_periodic_cleanup.py -q --cov=src/aiq_agent --cov-report=xml
 
       - name: Pip audit
         run: uv run pip-audit
