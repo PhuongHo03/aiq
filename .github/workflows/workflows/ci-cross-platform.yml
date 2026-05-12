@@ -1,0 +1,36 @@
+name: CI Cross Platform
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main, develop]
+
+jobs:
+  setup-script-syntax:
+    name: setup syntax (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate setup.sh on Linux
+        if: matrix.os == 'ubuntu-latest'
+        run: bash -n ./setup.sh
+
+      - name: Validate setup.sh on Windows (Git Bash)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: bash -n ./setup.sh
+
+  windows-arm64-smoke:
+    name: Windows arm64 note
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compatibility note
+        run: |
+          echo "Windows arm64 hosted runners may not be available in all GitHub plans."
+          echo "Use self-hosted windows-arm64 runner for full matrix enforcement."
