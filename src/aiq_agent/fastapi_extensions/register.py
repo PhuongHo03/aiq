@@ -23,7 +23,7 @@ as sources/knowledge_layer/src/register.py.
 
 import logging
 import os
-from typing import override
+from typing_extensions import override
 
 from fastapi import FastAPI
 from pydantic import Field
