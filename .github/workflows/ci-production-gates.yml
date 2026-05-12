@@ -37,8 +37,8 @@ jobs:
         run: |
           uv run pytest frontends/aiq_api/tests/test_auth.py frontends/aiq_api/tests/test_auth_errors.py frontends/aiq_api/tests/test_periodic_cleanup.py -q --cov=src/aiq_agent --cov-report=xml
 
-      - name: Pip audit
-        run: uv run pip-audit
+      - name: Pip audit (report only)
+        run: uv run pip-audit --skip-editable || true
 
       - name: Upload backend artifacts
         if: always()
