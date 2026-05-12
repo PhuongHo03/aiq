@@ -1,0 +1,511 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUNTIME_DIR="$ROOT_DIR/.runtime"
+VENV_DIR="$ROOT_DIR/.venv"
+UI_DIR="$ROOT_DIR/frontends/ui"
+ENV_FILE="$ROOT_DIR/deploy/.env"
+BACKEND_PID_FILE="$RUNTIME_DIR/backend.pid"
+FRONTEND_PID_FILE="$RUNTIME_DIR/frontend.pid"
+BACKEND_LOG="$RUNTIME_DIR/backend.log"
+FRONTEND_LOG="$RUNTIME_DIR/frontend.log"
+BOOTSTRAP_MARKER="$RUNTIME_DIR/bootstrap.complete"
+PORTS_FILE="$RUNTIME_DIR/ports.env"
+COMPOSE_FILE="$ROOT_DIR/deploy/compose/docker-compose.yaml"
+
+BACKEND_PORT="${AIQ_BACKEND_PORT:-8000}"
+FRONTEND_PORT="${AIQ_FRONTEND_PORT:-3000}"
+POSTGRES_PORT="${AIQ_POSTGRES_PORT:-5432}"
+CONFIG_FILE="${AIQ_CONFIG_FILE:-configs/config_web_default_llamaindex.yml}"
+AIQ_SUPPORT_SERVICES="${AIQ_SUPPORT_SERVICES:-true}"
+AIQ_REQUIRE_FULL_SOURCES="${AIQ_REQUIRE_FULL_SOURCES:-true}"
+
+usage() {
+  cat <<EOF
+Usage: ./setup.sh [--up|--down|--clean]
+
+Flags:
+  --up     Bootstrap (once) and start backend + frontend
+  --down   Stop backend + frontend started by this script
+  --clean  Full reset: --down + remove volumes/artifacts/deps
+
+Optional env vars:
+  AIQ_BACKEND_PORT   Backend port (default: 8000)
+  AIQ_FRONTEND_PORT  Frontend port (default: 3000)
+  AIQ_POSTGRES_PORT  Postgres host port (default: 5432)
+  AIQ_CONFIG_FILE    Backend config (default: configs/config_web_default_llamaindex.yml)
+  AIQ_SUPPORT_SERVICES Start/stop support services via compose (default: true)
+  AIQ_REQUIRE_FULL_SOURCES Require NVIDIA/Tavily/Serper keys on --up (default: true)
+EOF
+}
+
+log() {
+  echo "[setup] $*"
+}
+
+ensure_runtime_dir() {
+  mkdir -p "$RUNTIME_DIR"
+}
+
+load_env() {
+  if [ ! -f "$ENV_FILE" ]; then
+    log "Missing deploy/.env"
+    log "Create it from template manually: cp deploy/.env.example deploy/.env"
+    exit 1
+  fi
+
+  # shellcheck disable=SC1090
+  set -a
+  source "$ENV_FILE"
+  set +a
+}
+
+validate_required_keys() {
+  if [ -z "${NVIDIA_API_KEY:-}" ]; then
+    log "Missing NVIDIA_API_KEY in deploy/.env"
+    exit 1
+  fi
+
+  if [ "$AIQ_REQUIRE_FULL_SOURCES" = "true" ]; then
+    if [ -z "${TAVILY_API_KEY:-}" ]; then
+      log "Missing TAVILY_API_KEY in deploy/.env (required for full-source mode)."
+      exit 1
+    fi
+
+    if [ -z "${SERPER_API_KEY:-}" ]; then
+      log "Missing SERPER_API_KEY in deploy/.env (required for full-source mode)."
+      exit 1
+    fi
+  fi
+}
+
+has_docker_compose() {
+  command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1
+}
+
+start_support_services() {
+  if [ "$AIQ_SUPPORT_SERVICES" != "true" ]; then
+    log "Support services disabled (AIQ_SUPPORT_SERVICES=$AIQ_SUPPORT_SERVICES)."
+    return
+  fi
+
+  if [ ! -f "$COMPOSE_FILE" ]; then
+    log "Compose file not found ($COMPOSE_FILE). Skipping support services."
+    return
+  fi
+
+  if ! has_docker_compose; then
+    log "Docker Compose not available. Skipping support services."
+    return
+  fi
+
+  POSTGRES_PORT="$(resolve_service_port "$POSTGRES_PORT" "POSTGRES")"
+
+  log "Starting support services (postgres) via Docker Compose on host port $POSTGRES_PORT..."
+  (
+    cd "$ROOT_DIR/deploy/compose"
+    POSTGRES_PORT="$POSTGRES_PORT" docker compose --env-file ../.env -f docker-compose.yaml up -d postgres
+  )
+}
+
+stop_support_services() {
+  if [ "$AIQ_SUPPORT_SERVICES" != "true" ]; then
+    return
+  fi
+
+  if [ ! -f "$COMPOSE_FILE" ]; then
+    return
+  fi
+
+  if ! has_docker_compose; then
+    return
+  fi
+
+  log "Stopping support services (postgres)..."
+  (
+    cd "$ROOT_DIR/deploy/compose"
+    POSTGRES_PORT="$POSTGRES_PORT" docker compose --env-file ../.env -f docker-compose.yaml stop postgres >/dev/null 2>&1 || true
+  )
+}
+
+clean_support_services() {
+  if [ ! -f "$COMPOSE_FILE" ]; then
+    return
+  fi
+
+  if ! has_docker_compose; then
+    return
+  fi
+
+  log "Removing compose services, containers, and volumes..."
+  (
+    cd "$ROOT_DIR/deploy/compose"
+    POSTGRES_PORT="$POSTGRES_PORT" docker compose --env-file ../.env -f docker-compose.yaml down -v --remove-orphans >/dev/null 2>&1 || true
+  )
+}
+
+activate_venv() {
+  if [ -f "$VENV_DIR/bin/activate" ]; then
+    # shellcheck disable=SC1091
+    source "$VENV_DIR/bin/activate"
+    return
+  fi
+  if [ -f "$VENV_DIR/Scripts/activate" ]; then
+    # shellcheck disable=SC1091
+    source "$VENV_DIR/Scripts/activate"
+    return
+  fi
+  log "Virtual environment activation script not found in $VENV_DIR"
+  exit 1
+}
+
+is_pid_running() {
+  local pid="$1"
+  [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1
+}
+
+read_pid() {
+  local pid_file="$1"
+  if [ -f "$pid_file" ]; then
+    tr -d '[:space:]' < "$pid_file"
+  fi
+}
+
+is_port_in_use() {
+  local port="$1"
+
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+    return $?
+  fi
+
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn | awk '{print $4}' | grep -E "(^|:)${port}$" >/dev/null 2>&1
+    return $?
+  fi
+
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -an 2>/dev/null | grep -E "[:.]${port}[[:space:]].*(LISTEN|LISTENING)" >/dev/null 2>&1
+    return $?
+  fi
+
+  # Fallback: if we cannot check, assume free to avoid false blocks.
+  return 1
+}
+
+wait_for_port() {
+  local port="$1"
+  local name="$2"
+  local attempts=60
+
+  for _ in $(seq 1 "$attempts"); do
+    if is_port_in_use "$port"; then
+      log "$name is ready on port $port"
+      return 0
+    fi
+    sleep 1
+  done
+
+  log "$name did not become ready on port $port within ${attempts}s"
+  return 1
+}
+
+ensure_port_available_for_service() {
+  return 0
+}
+
+find_available_port() {
+  local start_port="$1"
+  local max_checks="${2:-200}"
+  local port="$start_port"
+  local checked=0
+
+  while [ "$checked" -lt "$max_checks" ]; do
+    if ! is_port_in_use "$port"; then
+      echo "$port"
+      return 0
+    fi
+    port=$((port + 1))
+    checked=$((checked + 1))
+  done
+
+  return 1
+}
+
+resolve_service_port() {
+  local requested_port="$1"
+  local service_name="$2"
+  local resolved_port
+
+  resolved_port="$(find_available_port "$requested_port" 200 || true)"
+  if [ -z "$resolved_port" ]; then
+    log "Unable to find available port for $service_name starting at $requested_port" >&2
+    exit 1
+  fi
+
+  if [ "$resolved_port" != "$requested_port" ]; then
+    log "Port $requested_port is busy. Using $service_name port $resolved_port instead." >&2
+  fi
+
+  echo "$resolved_port"
+}
+
+write_runtime_ports_file() {
+  ensure_runtime_dir
+
+  cat > "$PORTS_FILE" <<EOF
+# Generated by setup.sh --up
+BACKEND_PORT=$BACKEND_PORT
+FRONTEND_PORT=$FRONTEND_PORT
+POSTGRES_PORT=$POSTGRES_PORT
+BACKEND_URL=http://localhost:$BACKEND_PORT
+FRONTEND_URL=http://localhost:$FRONTEND_PORT
+EOF
+
+  log "Saved runtime ports to $PORTS_FILE"
+}
+
+bootstrap_once() {
+  ensure_runtime_dir
+
+  local needs_bootstrap="false"
+
+  if [ ! -d "$VENV_DIR" ]; then
+    needs_bootstrap="true"
+  elif [ ! -f "$BOOTSTRAP_MARKER" ]; then
+    needs_bootstrap="true"
+  fi
+
+  if [ "$needs_bootstrap" = "false" ]; then
+    activate_venv
+    if ! python -c "import nat" >/dev/null 2>&1; then
+      needs_bootstrap="true"
+    fi
+  fi
+
+  if [ "$needs_bootstrap" = "false" ]; then
+    if [ ! -d "$UI_DIR/node_modules" ]; then
+      needs_bootstrap="true"
+    fi
+  fi
+
+  if [ "$needs_bootstrap" = "false" ]; then
+    log "Bootstrap already complete. Skipping venv/dependency installation."
+    return
+  fi
+
+  log "Bootstrapping environment for UI/API runtime (venv + minimal dependencies)..."
+
+  local py_bin
+  py_bin="$(command -v python3 || command -v python || true)"
+  if [ -z "$py_bin" ]; then
+    log "Python not found. Install Python 3.11+ and retry."
+    exit 1
+  fi
+
+  if [ ! -d "$VENV_DIR" ]; then
+    "$py_bin" -m venv "$VENV_DIR"
+  fi
+
+  activate_venv
+
+  local uv_bin
+  uv_bin="$(command -v uv || true)"
+  if [ -z "$uv_bin" ] && [ -x "$HOME/.local/bin/uv" ]; then
+    uv_bin="$HOME/.local/bin/uv"
+  fi
+
+  pip_install_with_retry() {
+    local max_attempts="${PIP_INSTALL_MAX_ATTEMPTS:-3}"
+    local attempt=1
+
+    while [ "$attempt" -le "$max_attempts" ]; do
+      if python -m pip install --retries 10 --timeout 120 "$@"; then
+        return 0
+      fi
+
+      if [ "$attempt" -lt "$max_attempts" ]; then
+        log "pip install failed (attempt $attempt/$max_attempts). Retrying..."
+      fi
+      attempt=$((attempt + 1))
+    done
+
+    log "pip install failed after $max_attempts attempts: $*"
+    return 1
+  }
+
+  if [ -n "$uv_bin" ]; then
+    log "Using uv for faster dependency sync..."
+    (
+      cd "$ROOT_DIR"
+      "$uv_bin" sync --package aiq-agent
+      "$uv_bin" pip install -e ./frontends/aiq_api
+      "$uv_bin" pip install -e ./sources/tavily_web_search
+      "$uv_bin" pip install -e ./sources/google_scholar_paper_search
+    )
+  else
+    log "uv not found. Falling back to pip installation."
+    pip_install_with_retry --upgrade pip
+    # Install workspace-local packages first so root dependency resolution
+    # does not attempt to fetch them from PyPI.
+    pip_install_with_retry -e "$ROOT_DIR/sources/knowledge_layer"
+    pip_install_with_retry "knowledge-layer[llamaindex,foundational_rag]"
+    pip_install_with_retry -e "$ROOT_DIR/sources/tavily_web_search"
+    pip_install_with_retry -e "$ROOT_DIR/sources/google_scholar_paper_search"
+    pip_install_with_retry -e "$ROOT_DIR/frontends/aiq_api"
+    pip_install_with_retry -e "$ROOT_DIR"
+  fi
+
+  if command -v npm >/dev/null 2>&1; then
+    (cd "$UI_DIR" && npm ci)
+  fi
+
+  touch "$BOOTSTRAP_MARKER"
+  log "Bootstrap complete."
+}
+
+start_backend() {
+  local existing_pid
+  existing_pid="$(read_pid "$BACKEND_PID_FILE")"
+
+  if is_pid_running "$existing_pid"; then
+    log "Backend already running (PID $existing_pid)."
+    return
+  fi
+
+  BACKEND_PORT="$(resolve_service_port "$BACKEND_PORT" "BACKEND")"
+
+  log "Starting backend on port $BACKEND_PORT (config: $CONFIG_FILE)..."
+  (
+    cd "$ROOT_DIR"
+    load_env
+    activate_venv
+    export PYTHONWARNINGS="${PYTHONWARNINGS:-ignore}"
+    nat serve --config_file "$CONFIG_FILE" --host 0.0.0.0 --port "$BACKEND_PORT"
+  ) >"$BACKEND_LOG" 2>&1 &
+
+  echo "$!" > "$BACKEND_PID_FILE"
+  wait_for_port "$BACKEND_PORT" "Backend"
+}
+
+start_frontend() {
+  local existing_pid
+  existing_pid="$(read_pid "$FRONTEND_PID_FILE")"
+
+  if is_pid_running "$existing_pid"; then
+    log "Frontend already running (PID $existing_pid)."
+    return
+  fi
+
+  FRONTEND_PORT="$(resolve_service_port "$FRONTEND_PORT" "FRONTEND")"
+
+  if [ ! -d "$UI_DIR/node_modules" ]; then
+    log "Installing frontend dependencies..."
+    (cd "$UI_DIR" && npm ci)
+  fi
+
+  log "Starting frontend on port $FRONTEND_PORT..."
+  (
+    cd "$UI_DIR"
+    load_env
+    export BACKEND_URL="${BACKEND_URL:-http://localhost:$BACKEND_PORT}"
+    export NEXT_PUBLIC_BACKEND_URL="$BACKEND_URL"
+    export PORT="$FRONTEND_PORT"
+    npm run dev
+  ) >"$FRONTEND_LOG" 2>&1 &
+
+  echo "$!" > "$FRONTEND_PID_FILE"
+  wait_for_port "$FRONTEND_PORT" "Frontend"
+}
+
+stop_service() {
+  local name="$1"
+  local pid_file="$2"
+  local pid
+  pid="$(read_pid "$pid_file")"
+
+  if is_pid_running "$pid"; then
+    log "Stopping $name (PID $pid)..."
+    kill "$pid" >/dev/null 2>&1 || true
+    sleep 1
+    if is_pid_running "$pid"; then
+      kill -9 "$pid" >/dev/null 2>&1 || true
+    fi
+  else
+    log "$name is not running."
+  fi
+
+  rm -f "$pid_file"
+}
+
+do_up() {
+  ensure_runtime_dir
+  load_env
+  validate_required_keys
+  start_support_services
+  bootstrap_once
+  start_backend
+  start_frontend
+  write_runtime_ports_file
+
+  log "All services are up:"
+  log "  Backend : http://localhost:$BACKEND_PORT"
+  log "  Frontend: http://localhost:$FRONTEND_PORT"
+  if [ "$AIQ_SUPPORT_SERVICES" = "true" ]; then
+    log "  Support : postgres via docker compose on port $POSTGRES_PORT (if available)"
+  fi
+  log "Logs:"
+  log "  $BACKEND_LOG"
+  log "  $FRONTEND_LOG"
+  log "Ports:"
+  log "  $PORTS_FILE"
+}
+
+do_down() {
+  ensure_runtime_dir
+  stop_service "Frontend" "$FRONTEND_PID_FILE"
+  stop_service "Backend" "$BACKEND_PID_FILE"
+  stop_support_services
+  log "All services stopped."
+}
+
+do_clean() {
+  do_down
+
+  clean_support_services
+
+  log "Removing local runtime artifacts..."
+  rm -rf "$RUNTIME_DIR"
+  rm -rf "$VENV_DIR"
+  rm -rf "$UI_DIR/node_modules"
+  rm -rf "$ROOT_DIR/.tmp"
+  rm -f "$ROOT_DIR/jobs.db" "$ROOT_DIR/checkpoints.db" "$ROOT_DIR/summaries.db"
+
+  log "Clean reset complete."
+}
+
+if [ "$#" -ne 1 ]; then
+  usage
+  exit 1
+fi
+
+case "$1" in
+  --up)
+    do_up
+    ;;
+  --down)
+    do_down
+    ;;
+  --clean)
+    do_clean
+    ;;
+  -h|--help)
+    usage
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac
