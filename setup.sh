@@ -481,6 +481,7 @@ start_frontend() {
     NEXT_INTERNAL_PORT="$resolved_next_internal_port"
     export BACKEND_URL="${BACKEND_URL:-http://localhost:$BACKEND_PORT}"
     export NEXT_PUBLIC_BACKEND_URL="$BACKEND_URL"
+    export AIQ_FRONTEND_HOST="${AIQ_FRONTEND_HOST:-0.0.0.0}"
     export PORT="$FRONTEND_PORT"
     export NEXT_DEV_PORT="$NEXT_INTERNAL_PORT"
     export NEXT_INTERNAL_URL="http://localhost:$NEXT_INTERNAL_PORT"
