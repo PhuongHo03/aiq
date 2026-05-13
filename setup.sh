@@ -208,7 +208,7 @@ is_port_in_use() {
 wait_for_port() {
   local port="$1"
   local name="$2"
-  local attempts=60
+  local attempts="${AIQ_SERVICE_START_ATTEMPTS:-180}"
 
   for _ in $(seq 1 "$attempts"); do
     if is_port_in_use "$port"; then
@@ -226,7 +226,7 @@ wait_for_service_start() {
   local pid_file="$1"
   local port="$2"
   local name="$3"
-  local attempts=60
+  local attempts="${AIQ_SERVICE_START_ATTEMPTS:-180}"
   local pid
 
   for _ in $(seq 1 "$attempts"); do
