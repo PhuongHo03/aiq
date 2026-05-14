@@ -91,7 +91,7 @@ Result: Structured report with full source citations, streamed to UI
 
 ```bash
 git clone <this-repo>
-cd aiq-blueprint
+cd aiq
 cp deploy/.env.example deploy/.env
 ```
 
