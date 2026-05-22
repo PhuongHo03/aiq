@@ -160,11 +160,13 @@ activate_venv() {
   if [ -f "$VENV_DIR/bin/activate" ]; then
     # shellcheck disable=SC1091
     source "$VENV_DIR/bin/activate"
+    export PATH="/usr/bin:/bin:$PATH"
     return
   fi
   if [ -f "$VENV_DIR/Scripts/activate" ]; then
     # shellcheck disable=SC1091
     source "$VENV_DIR/Scripts/activate"
+    export PATH="/usr/bin:/bin:$PATH"
     return
   fi
   log "Virtual environment activation script not found in $VENV_DIR"
@@ -201,6 +203,11 @@ is_port_in_use() {
     return $?
   fi
 
+  if command -v powershell.exe >/dev/null 2>&1; then
+    AIQ_CHECK_PORT="$port" powershell.exe -NoProfile -Command 'try { $c = Get-NetTCPConnection -LocalPort ([int]$env:AIQ_CHECK_PORT) -State Listen -ErrorAction Stop | Select-Object -First 1; if ($c) { exit 0 } } catch {}; exit 1' >/dev/null 2>&1
+    return $?
+  fi
+
   # Fallback: if we cannot check, assume free to avoid false blocks.
   return 1
 }
@@ -210,7 +217,9 @@ wait_for_port() {
   local name="$2"
   local attempts="${AIQ_SERVICE_START_ATTEMPTS:-180}"
 
-  for _ in $(seq 1 "$attempts"); do
+  local attempt=0
+  while [ "$attempt" -lt "$attempts" ]; do
+    attempt=$((attempt + 1))
     if is_port_in_use "$port"; then
       log "$name is ready on port $port"
       return 0
@@ -229,7 +238,9 @@ wait_for_service_start() {
   local attempts="${AIQ_SERVICE_START_ATTEMPTS:-180}"
   local pid
 
-  for _ in $(seq 1 "$attempts"); do
+  local attempt=0
+  while [ "$attempt" -lt "$attempts" ]; do
+    attempt=$((attempt + 1))
     pid="$(read_pid "$pid_file")"
     if ! is_pid_running "$pid"; then
       log "$name process exited before port $port became ready"
@@ -424,7 +435,7 @@ bootstrap_once() {
     (cd "$UI_DIR" && npm ci)
   fi
 
-  touch "$BOOTSTRAP_MARKER"
+  : > "$BOOTSTRAP_MARKER"
   log "Bootstrap complete."
 }
 
