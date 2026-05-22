@@ -208,6 +208,11 @@ is_port_in_use() {
     return $?
   fi
 
+  if command -v powershell.exe >/dev/null 2>&1; then
+    AIQ_CHECK_PORT="$port" powershell.exe -NoProfile -Command 'try { $c = Get-NetTCPConnection -LocalPort ([int]$env:AIQ_CHECK_PORT) -State Listen -ErrorAction Stop | Select-Object -First 1; if ($c) { exit 0 } } catch {}; exit 1' >/dev/null 2>&1
+    return $?
+  fi
+
   # Fallback: if we cannot check, assume free to avoid false blocks.
   return 1
 }
