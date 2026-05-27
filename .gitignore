@@ -1,0 +1,12 @@
+.runtime/
+.venv/
+deploy/.env
+
+*.db
+*.db-shm
+*.db-wal
+__pycache__/
+*.py[cod]
+
+frontends/ui/.next/
+frontends/ui/node_modules/

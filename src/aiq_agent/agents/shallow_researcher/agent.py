@@ -54,6 +54,36 @@ logger = logging.getLogger(__name__)
 AGENT_DIR = Path(__file__).parent
 
 
+def _allows_unsourced_direct_answer(content: str) -> bool:
+    """Allow direct answers only when the model explicitly says no citation is needed."""
+    normalized = content.lower()
+    direct_answer_markers = (
+        "references: none required",
+        "references:** none required",
+        "no references required",
+        "no citation required",
+        "no sources required",
+    )
+    return any(marker in normalized for marker in direct_answer_markers)
+
+
+def _request_allows_unsourced_direct_answer(state: ShallowResearchAgentState) -> bool:
+    """Allow no-source output when the user explicitly requests no references."""
+    request_markers = (
+        "no references required",
+        "no citation required",
+        "no citations required",
+        "no sources required",
+        "without references",
+        "without citations",
+    )
+    for message in reversed(state.messages):
+        if isinstance(message, HumanMessage):
+            content = str(message.content).lower()
+            return any(marker in content for marker in request_markers)
+    return False
+
+
 class ShallowResearcherAgent:
     """
     Shallow research agent for fast, bounded research with tool-calling.
@@ -311,6 +341,14 @@ class ShallowResearcherAgent:
                         len(registry.all_sources()),
                     )
                     content = verification.verified_report
+                elif (
+                    os.environ.get("AIQ_ALLOW_UNSOURCED_SIMPLE_ANSWERS", "true").lower() == "true"
+                    and (
+                        _allows_unsourced_direct_answer(content)
+                        or _request_allows_unsourced_direct_answer(state)
+                    )
+                ):
+                    logger.info("Shallow researcher returned a direct unsourced answer marked as citation-free.")
                 else:
                     from aiq_agent.common.tool_validation import validate_tool_availability
 

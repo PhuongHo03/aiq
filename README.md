@@ -109,7 +109,7 @@ SERPER_API_KEY=...            # Required — academic paper search
 ./setup.sh --up
 ```
 
-🎉 Frontend opens at the URL printed in the terminal.
+🎉 Frontend opens at the URL printed in the terminal. AI Hub installs keep host ports inside `6000-6050` by default (`6042` API, `6043` UI, `6044` Next.js internal dev server, `6045` Postgres).
 
 **Stop and clean up:**
 
@@ -209,12 +209,18 @@ llms:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `AIQ_BACKEND_PORT` | auto | Backend API port |
-| `AIQ_FRONTEND_PORT` | auto | Frontend UI port |
-| `AIQ_POSTGRES_PORT` | auto | PostgreSQL port |
+| `AIQ_PORT_MIN` | `6000` | Lowest host port `setup.sh` may use |
+| `AIQ_PORT_MAX` | `6050` | Highest host port `setup.sh` may use |
+| `AIQ_BACKEND_PORT` | `6042` | Backend API port |
+| `AIQ_FRONTEND_PORT` | `6043` | Frontend UI port |
+| `AIQ_NEXT_INTERNAL_PORT` | `6044` | Internal Next.js dev server port |
+| `AIQ_POSTGRES_PORT` | `6045` | PostgreSQL host port |
 | `AIQ_CONFIG_FILE` | `configs/config_web_default_llamaindex.yml` | Active config file |
 | `AIQ_SUPPORT_SERVICES` | `true` | Enable/disable postgres |
 | `AIQ_REQUIRE_FULL_SOURCES` | `false` | Require all API keys |
+| `AIQ_ALLOW_UNSOURCED_SIMPLE_ANSWERS` | `true` | Allow direct NVIDIA-only answers when the model explicitly marks that no citation is required |
+
+If a requested port is busy or outside `AIQ_PORT_MIN-AIQ_PORT_MAX`, `setup.sh` picks the next free port in that range and writes the final values to `.runtime/ports.env`.
 
 ---
 

@@ -15,13 +15,16 @@ BOOTSTRAP_MARKER="$RUNTIME_DIR/bootstrap.complete"
 PORTS_FILE="$RUNTIME_DIR/ports.env"
 COMPOSE_FILE="$ROOT_DIR/deploy/compose/docker-compose.yaml"
 
-BACKEND_PORT="${AIQ_BACKEND_PORT:-8000}"
-FRONTEND_PORT="${AIQ_FRONTEND_PORT:-3000}"
-NEXT_INTERNAL_PORT="${AIQ_NEXT_INTERNAL_PORT:-3001}"
-POSTGRES_PORT="${AIQ_POSTGRES_PORT:-5432}"
+AIQ_PORT_MIN="${AIQ_PORT_MIN:-6000}"
+AIQ_PORT_MAX="${AIQ_PORT_MAX:-6050}"
+AIQ_RESERVED_PORTS="${AIQ_RESERVED_PORTS:-}"
+BACKEND_PORT="${AIQ_BACKEND_PORT:-6042}"
+FRONTEND_PORT="${AIQ_FRONTEND_PORT:-6043}"
+NEXT_INTERNAL_PORT="${AIQ_NEXT_INTERNAL_PORT:-6044}"
+POSTGRES_PORT="${AIQ_POSTGRES_PORT:-6045}"
 CONFIG_FILE="${AIQ_CONFIG_FILE:-configs/config_web_default_llamaindex.yml}"
 AIQ_SUPPORT_SERVICES="${AIQ_SUPPORT_SERVICES:-true}"
-AIQ_REQUIRE_FULL_SOURCES="${AIQ_REQUIRE_FULL_SOURCES:-true}"
+AIQ_REQUIRE_FULL_SOURCES="${AIQ_REQUIRE_FULL_SOURCES:-false}"
 
 usage() {
   cat <<EOF
@@ -33,13 +36,15 @@ Flags:
   --clean  Full reset: --down + remove volumes/artifacts/deps
 
 Optional env vars:
-  AIQ_BACKEND_PORT   Backend port (default: 8000)
-  AIQ_FRONTEND_PORT  Frontend port (default: 3000)
-  AIQ_NEXT_INTERNAL_PORT Next.js dev port behind the gateway (default: 3001)
-  AIQ_POSTGRES_PORT  Postgres host port (default: 5432)
+  AIQ_PORT_MIN       Lowest host port setup.sh may use (default: 6000)
+  AIQ_PORT_MAX       Highest host port setup.sh may use (default: 6050)
+  AIQ_BACKEND_PORT   Backend port (default: 6042)
+  AIQ_FRONTEND_PORT  Frontend port (default: 6043)
+  AIQ_NEXT_INTERNAL_PORT Next.js dev port behind the gateway (default: 6044)
+  AIQ_POSTGRES_PORT  Postgres host port (default: 6045)
   AIQ_CONFIG_FILE    Backend config (default: configs/config_web_default_llamaindex.yml)
   AIQ_SUPPORT_SERVICES Start/stop support services via compose (default: true)
-  AIQ_REQUIRE_FULL_SOURCES Require NVIDIA/Tavily/Serper keys on --up (default: true)
+  AIQ_REQUIRE_FULL_SOURCES Require NVIDIA/Tavily/Serper keys on --up (default: false)
 EOF
 }
 
@@ -63,6 +68,9 @@ load_env() {
   source "$ENV_FILE"
   set +a
 
+  AIQ_PORT_MIN="${AIQ_PORT_MIN:-6000}"
+  AIQ_PORT_MAX="${AIQ_PORT_MAX:-6050}"
+  AIQ_RESERVED_PORTS="${AIQ_RESERVED_PORTS:-}"
   BACKEND_PORT="${AIQ_BACKEND_PORT:-$BACKEND_PORT}"
   FRONTEND_PORT="${AIQ_FRONTEND_PORT:-$FRONTEND_PORT}"
   NEXT_INTERNAL_PORT="${AIQ_NEXT_INTERNAL_PORT:-$NEXT_INTERNAL_PORT}"
@@ -156,6 +164,21 @@ clean_support_services() {
   )
 }
 
+start_detached() {
+  local log_file="$1"
+  shift
+
+  if command -v setsid >/dev/null 2>&1; then
+    setsid env "$@" >"$log_file" 2>&1 &
+  elif command -v nohup >/dev/null 2>&1; then
+    nohup env "$@" >"$log_file" 2>&1 &
+  else
+    env "$@" >"$log_file" 2>&1 &
+  fi
+
+  echo "$!"
+}
+
 activate_venv() {
   if [ -f "$VENV_DIR/bin/activate" ]; then
     # shellcheck disable=SC1091
@@ -189,28 +212,49 @@ is_port_in_use() {
   local port="$1"
 
   if command -v lsof >/dev/null 2>&1; then
-    lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
-    return $?
+    if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+      return 0
+    fi
   fi
 
   if command -v ss >/dev/null 2>&1; then
-    ss -ltn | awk '{print $4}' | grep -E "(^|:)${port}$" >/dev/null 2>&1
-    return $?
+    if ss -ltn | awk '{print $4}' | grep -E "(^|:)${port}$" >/dev/null 2>&1; then
+      return 0
+    fi
   fi
 
   if command -v netstat >/dev/null 2>&1; then
-    netstat -an 2>/dev/null | grep -E "[:.]${port}[[:space:]].*(LISTEN|LISTENING)" >/dev/null 2>&1
-    return $?
+    if netstat -an 2>/dev/null | grep -E "[:.]${port}[[:space:]].*(LISTEN|LISTENING)" >/dev/null 2>&1; then
+      return 0
+    fi
   fi
 
   if command -v powershell.exe >/dev/null 2>&1; then
-    AIQ_CHECK_PORT="$port" powershell.exe -NoProfile -Command 'try { $c = Get-NetTCPConnection -LocalPort ([int]$env:AIQ_CHECK_PORT) -State Listen -ErrorAction Stop | Select-Object -First 1; if ($c) { exit 0 } } catch {}; exit 1' >/dev/null 2>&1
-    return $?
+    if AIQ_CHECK_PORT="$port" powershell.exe -NoProfile -Command 'try { $c = Get-NetTCPConnection -LocalPort ([int]$env:AIQ_CHECK_PORT) -State Listen -ErrorAction Stop | Select-Object -First 1; if ($c) { exit 0 } } catch {}; exit 1' >/dev/null 2>&1; then
+      return 0
+    fi
   fi
 
-  if command -v powershell.exe >/dev/null 2>&1; then
-    AIQ_CHECK_PORT="$port" powershell.exe -NoProfile -Command 'try { $c = Get-NetTCPConnection -LocalPort ([int]$env:AIQ_CHECK_PORT) -State Listen -ErrorAction Stop | Select-Object -First 1; if ($c) { exit 0 } } catch {}; exit 1' >/dev/null 2>&1
-    return $?
+  if command -v docker >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+    local published_ports
+    published_ports="$(docker ps --format '{{.Ports}}' 2>/dev/null || true)"
+    if AIQ_DOCKER_PORTS="$published_ports" python3 - "$port" <<'PY'
+import os
+import re
+import sys
+
+target = int(sys.argv[1])
+ports = os.environ.get("AIQ_DOCKER_PORTS", "")
+for match in re.finditer(r"(?:^|[, ])(?:\d+\.\d+\.\d+\.\d+|\[::\]|localhost):(\d+)(?:-(\d+))?->", ports):
+    start = int(match.group(1))
+    end = int(match.group(2) or start)
+    if start <= target <= end:
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+    then
+      return 0
+    fi
   fi
 
   # Fallback: if we cannot check, assume free to avoid false blocks.
@@ -275,20 +319,30 @@ ensure_port_available_for_service() {
 
 find_available_port() {
   local start_port="$1"
-  local max_checks="${2:-200}"
+  local max_port="${2:-$AIQ_PORT_MAX}"
   local port="$start_port"
-  local checked=0
 
-  while [ "$checked" -lt "$max_checks" ]; do
-    if ! is_port_in_use "$port"; then
+  if [ "$port" -lt "$AIQ_PORT_MIN" ] || [ "$port" -gt "$max_port" ]; then
+    port="$AIQ_PORT_MIN"
+  fi
+
+  while [ "$port" -le "$max_port" ]; do
+    if ! is_port_in_use "$port" && ! is_port_reserved "$port"; then
       echo "$port"
       return 0
     fi
     port=$((port + 1))
-    checked=$((checked + 1))
   done
 
   return 1
+}
+
+is_port_reserved() {
+  local port="$1"
+  case " $AIQ_RESERVED_PORTS " in
+    *" $port "*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 resolve_service_port() {
@@ -296,14 +350,14 @@ resolve_service_port() {
   local service_name="$2"
   local resolved_port
 
-  resolved_port="$(find_available_port "$requested_port" 200 || true)"
+  resolved_port="$(find_available_port "$requested_port" "$AIQ_PORT_MAX" || true)"
   if [ -z "$resolved_port" ]; then
-    log "Unable to find available port for $service_name starting at $requested_port" >&2
+    log "Unable to find available port for $service_name in range $AIQ_PORT_MIN-$AIQ_PORT_MAX" >&2
     exit 1
   fi
 
   if [ "$resolved_port" != "$requested_port" ]; then
-    log "Port $requested_port is busy. Using $service_name port $resolved_port instead." >&2
+    log "Port $requested_port is unavailable or outside $AIQ_PORT_MIN-$AIQ_PORT_MAX. Using $service_name port $resolved_port instead." >&2
   fi
 
   echo "$resolved_port"
@@ -318,6 +372,8 @@ BACKEND_PORT=$BACKEND_PORT
 FRONTEND_PORT=$FRONTEND_PORT
 NEXT_INTERNAL_PORT=$NEXT_INTERNAL_PORT
 POSTGRES_PORT=$POSTGRES_PORT
+AIQ_PORT_MIN=$AIQ_PORT_MIN
+AIQ_PORT_MAX=$AIQ_PORT_MAX
 BACKEND_URL=http://localhost:$BACKEND_PORT
 FRONTEND_URL=http://localhost:$FRONTEND_PORT
 NEXT_INTERNAL_URL=http://localhost:$NEXT_INTERNAL_PORT
@@ -444,6 +500,30 @@ bootstrap_once() {
   log "Bootstrap complete."
 }
 
+run_backend_process() {
+  cd "$ROOT_DIR"
+  load_env
+  BACKEND_PORT="${AIQ_RESOLVED_BACKEND_PORT:-$BACKEND_PORT}"
+  activate_venv
+  export PYTHONWARNINGS="${PYTHONWARNINGS:-ignore}"
+  exec nat serve --config_file "$CONFIG_FILE" --host 0.0.0.0 --port "$BACKEND_PORT"
+}
+
+run_frontend_process() {
+  cd "$UI_DIR"
+  load_env
+  BACKEND_PORT="${AIQ_RESOLVED_BACKEND_PORT:-$BACKEND_PORT}"
+  FRONTEND_PORT="${AIQ_RESOLVED_FRONTEND_PORT:-$FRONTEND_PORT}"
+  NEXT_INTERNAL_PORT="${AIQ_RESOLVED_NEXT_INTERNAL_PORT:-$NEXT_INTERNAL_PORT}"
+  export BACKEND_URL="${BACKEND_URL:-http://localhost:$BACKEND_PORT}"
+  export NEXT_PUBLIC_BACKEND_URL="$BACKEND_URL"
+  export AIQ_FRONTEND_HOST="${AIQ_FRONTEND_HOST:-0.0.0.0}"
+  export PORT="$FRONTEND_PORT"
+  export NEXT_DEV_PORT="$NEXT_INTERNAL_PORT"
+  export NEXT_INTERNAL_URL="http://localhost:$NEXT_INTERNAL_PORT"
+  exec npm run dev
+}
+
 start_backend() {
   local existing_pid
   existing_pid="$(read_pid "$BACKEND_PID_FILE")"
@@ -457,21 +537,15 @@ start_backend() {
   local resolved_backend_port="$BACKEND_PORT"
 
   log "Starting backend on port $BACKEND_PORT (config: $CONFIG_FILE)..."
-  (
-    cd "$ROOT_DIR"
-    load_env
-    BACKEND_PORT="$resolved_backend_port"
-    activate_venv
-    export PYTHONWARNINGS="${PYTHONWARNINGS:-ignore}"
-    nat serve --config_file "$CONFIG_FILE" --host 0.0.0.0 --port "$BACKEND_PORT"
-  ) >"$BACKEND_LOG" 2>&1 &
-
-  echo "$!" > "$BACKEND_PID_FILE"
+  start_detached "$BACKEND_LOG" \
+    AIQ_RESOLVED_BACKEND_PORT="$resolved_backend_port" \
+    "$ROOT_DIR/setup.sh" --run-backend > "$BACKEND_PID_FILE"
   wait_for_service_start "$BACKEND_PID_FILE" "$BACKEND_PORT" "Backend"
 }
 
 start_frontend() {
   local existing_pid
+  local previous_reserved_ports
   existing_pid="$(read_pid "$FRONTEND_PID_FILE")"
 
   if is_pid_running "$existing_pid"; then
@@ -479,8 +553,16 @@ start_frontend() {
     return
   fi
 
+  stop_unix_ui_orphans
+  stop_windows_ui_orphans
+
+  previous_reserved_ports="$AIQ_RESERVED_PORTS"
+  AIQ_RESERVED_PORTS="$AIQ_RESERVED_PORTS $BACKEND_PORT $POSTGRES_PORT"
   FRONTEND_PORT="$(resolve_service_port "$FRONTEND_PORT" "FRONTEND")"
+  AIQ_RESERVED_PORTS="$AIQ_RESERVED_PORTS $FRONTEND_PORT"
   NEXT_INTERNAL_PORT="$(resolve_service_port "$NEXT_INTERNAL_PORT" "NEXT_INTERNAL")"
+  AIQ_RESERVED_PORTS="$previous_reserved_ports"
+  local resolved_backend_port="$BACKEND_PORT"
   local resolved_frontend_port="$FRONTEND_PORT"
   local resolved_next_internal_port="$NEXT_INTERNAL_PORT"
 
@@ -490,21 +572,11 @@ start_frontend() {
   fi
 
   log "Starting frontend on port $FRONTEND_PORT..."
-  (
-    cd "$UI_DIR"
-    load_env
-    FRONTEND_PORT="$resolved_frontend_port"
-    NEXT_INTERNAL_PORT="$resolved_next_internal_port"
-    export BACKEND_URL="${BACKEND_URL:-http://localhost:$BACKEND_PORT}"
-    export NEXT_PUBLIC_BACKEND_URL="$BACKEND_URL"
-    export AIQ_FRONTEND_HOST="${AIQ_FRONTEND_HOST:-0.0.0.0}"
-    export PORT="$FRONTEND_PORT"
-    export NEXT_DEV_PORT="$NEXT_INTERNAL_PORT"
-    export NEXT_INTERNAL_URL="http://localhost:$NEXT_INTERNAL_PORT"
-    npm run dev
-  ) >"$FRONTEND_LOG" 2>&1 &
-
-  echo "$!" > "$FRONTEND_PID_FILE"
+  start_detached "$FRONTEND_LOG" \
+    AIQ_RESOLVED_BACKEND_PORT="$resolved_backend_port" \
+    AIQ_RESOLVED_FRONTEND_PORT="$resolved_frontend_port" \
+    AIQ_RESOLVED_NEXT_INTERNAL_PORT="$resolved_next_internal_port" \
+    "$ROOT_DIR/setup.sh" --run-frontend > "$FRONTEND_PID_FILE"
   wait_for_service_start "$FRONTEND_PID_FILE" "$FRONTEND_PORT" "Frontend"
 }
 
@@ -519,10 +591,12 @@ stop_service() {
     if command -v taskkill.exe >/dev/null 2>&1; then
       taskkill.exe /PID "$pid" /T /F >/dev/null 2>&1 || true
     else
+      kill -- "-$pid" >/dev/null 2>&1 || true
       kill "$pid" >/dev/null 2>&1 || true
     fi
     sleep 1
     if is_pid_running "$pid"; then
+      kill -9 -- "-$pid" >/dev/null 2>&1 || true
       kill -9 "$pid" >/dev/null 2>&1 || true
     fi
   else
@@ -548,6 +622,33 @@ stop_windows_ui_orphans() {
       Where-Object { \$_.CommandLine -and \$_.CommandLine.Contains(\$ui) } | \
       ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }" \
     >/dev/null 2>&1 || true
+}
+
+stop_unix_ui_orphans() {
+  if ! command -v pgrep >/dev/null 2>&1; then
+    return
+  fi
+
+  local pids
+  pids="$(pgrep -f "$UI_DIR" 2>/dev/null || true)"
+  if [ -z "$pids" ]; then
+    return
+  fi
+
+  log "Stopping orphan frontend processes for $UI_DIR..."
+  for pid in $pids; do
+    if [ "$pid" != "$$" ]; then
+      kill "$pid" >/dev/null 2>&1 || true
+    fi
+  done
+
+  sleep 1
+  pids="$(pgrep -f "$UI_DIR" 2>/dev/null || true)"
+  for pid in $pids; do
+    if [ "$pid" != "$$" ]; then
+      kill -9 "$pid" >/dev/null 2>&1 || true
+    fi
+  done
 }
 
 do_up() {
@@ -576,6 +677,7 @@ do_up() {
 do_down() {
   ensure_runtime_dir
   stop_service "Frontend" "$FRONTEND_PID_FILE"
+  stop_unix_ui_orphans
   stop_windows_ui_orphans
   stop_service "Backend" "$BACKEND_PID_FILE"
   stop_support_services
@@ -614,6 +716,12 @@ case "$1" in
     ;;
   -h|--help)
     usage
+    ;;
+  --run-backend)
+    run_backend_process
+    ;;
+  --run-frontend)
+    run_frontend_process
     ;;
   *)
     usage
